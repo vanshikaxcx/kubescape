@@ -523,6 +523,10 @@ func (d *reportDecryptor) remapResult(result rawObject, resultIndex int) error {
 
 	for controlIndex := range controls {
 		controlContext := fmt.Sprintf("%s.controls[%d]", context, controlIndex)
+		// The evidence is restored first: a control without rules has some too.
+		if err := d.decryptControlEvidence(controls[controlIndex], controlContext); err != nil {
+			return err
+		}
 		rulesRaw, ok := controls[controlIndex]["rules"]
 		if !ok || isJSONNull(rulesRaw) {
 			continue
@@ -628,6 +632,33 @@ func (d *reportDecryptor) remapRule(rule rawObject, context string) error {
 	}
 	rule["relatedResourcesIDs"] = updatedRelated
 
+	return nil
+}
+
+// decryptControlEvidence restores the values in the evidence of a control. They
+// are read from the resource's object, so with --encrypt they are ciphertext
+// whenever the field they read is, such as a container image. The paths are
+// field paths of the resource, not values, and are left as they are.
+func (d *reportDecryptor) decryptControlEvidence(control rawObject, context string) error {
+	evidenceRaw, ok := control["evidence"]
+	if !ok || isJSONNull(evidenceRaw) {
+		return nil
+	}
+	evidenceContext := context + ".evidence"
+	evidence, err := decodeObjectArray(evidenceRaw, evidenceContext)
+	if err != nil {
+		return err
+	}
+	for i := range evidence {
+		valueContext := fmt.Sprintf("%s[%d].value", evidenceContext, i)
+		if err := d.decryptStringField(evidence[i], "value", valueContext, decryptEmbeddedCiphertexts); err != nil {
+			return err
+		}
+	}
+	control["evidence"], err = json.Marshal(evidence)
+	if err != nil {
+		return fmt.Errorf("failed to marshal %s: %w", evidenceContext, err)
+	}
 	return nil
 }
 

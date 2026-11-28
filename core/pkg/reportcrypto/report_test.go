@@ -538,6 +538,26 @@ func TestDecryptReportValidationErrorsIncludeFieldContext(t *testing.T) {
 			wantContext: "results[0].controls[0].rules",
 		},
 		{
+			name: "evidence object",
+			mutate: func(t *testing.T, report map[string]any) {
+				result := requireTestArray(t, report, "results")[0].(map[string]any)
+				control := requireTestArray(t, result, "controls")[0].(map[string]any)
+				control["evidence"] = map[string]any{}
+			},
+			wantError:   "failed to parse",
+			wantContext: "results[0].controls[0].evidence",
+		},
+		{
+			name: "evidence value number",
+			mutate: func(t *testing.T, report map[string]any) {
+				result := requireTestArray(t, report, "results")[0].(map[string]any)
+				control := requireTestArray(t, result, "controls")[0].(map[string]any)
+				control["evidence"] = []any{map[string]any{"path": "spec.hostPID", "value": 5}}
+			},
+			wantError:   "failed to parse",
+			wantContext: "results[0].controls[0].evidence[0].value",
+		},
+		{
 			name: "paths object",
 			mutate: func(t *testing.T, report map[string]any) {
 				result := requireTestArray(t, report, "results")[0].(map[string]any)
@@ -641,6 +661,68 @@ func TestDecryptReportFromEnvRequiresKey(t *testing.T) {
 	_, err := DecryptReportFromEnv(fixture.data)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), testMasterKeyEnv)
+}
+
+// The evidence of a control holds values read from the resource's object, so
+// under --encrypt a value such as a container image is ciphertext. It is
+// restored with the rest of the report, and the plain values and the paths
+// next to it are left as they are.
+func TestDecryptReportRestoresControlEvidence(t *testing.T) {
+	fixture := newEncryptedReportFixture(t, true, true)
+	const image = "registry.example.com/payments:v1.2.3"
+	encryptedImage, err := EncryptString(image, fixture.dek)
+	require.NoError(t, err)
+	assert.NotContains(t, encryptedImage, image)
+
+	report := decodeTestObject(t, fixture.data)
+	result := requireTestArray(t, report, "results")[0].(map[string]any)
+	controls := requireTestArray(t, result, "controls")
+	withRules := controls[0].(map[string]any)
+	withRules["evidence"] = []any{
+		map[string]any{"path": "spec.template.spec.containers[0].image", "value": encryptedImage},
+		map[string]any{"path": "spec.template.spec.hostPID", "value": "true"},
+	}
+	// A control with evidence and no rules is restored too.
+	withoutRules := map[string]any{
+		"controlID": "C-0078",
+		"evidence": []any{
+			map[string]any{"path": "spec.containers[0].image", "value": encryptedImage},
+		},
+	}
+	result["controls"] = append(controls, withoutRules)
+
+	decrypted, err := DecryptReport(mustMarshalTestJSON(t, report), []byte(testMasterKey))
+	require.NoError(t, err)
+
+	restored := decodeTestObject(t, decrypted)
+	restoredControls := requireTestArray(t, requireTestArray(t, restored, "results")[0].(map[string]any), "controls")
+	require.Len(t, restoredControls, 2)
+
+	evidence := requireTestArray(t, restoredControls[0].(map[string]any), "evidence")
+	require.Len(t, evidence, 2)
+	assert.Equal(t, map[string]any{"path": "spec.template.spec.containers[0].image", "value": image}, evidence[0])
+	assert.Equal(t, map[string]any{"path": "spec.template.spec.hostPID", "value": "true"}, evidence[1])
+
+	evidence = requireTestArray(t, restoredControls[1].(map[string]any), "evidence")
+	assert.Equal(t, []any{map[string]any{"path": "spec.containers[0].image", "value": image}}, evidence)
+	assert.NotContains(t, string(decrypted), encryptedImage)
+}
+
+// Evidence that was never encrypted, or is null, is left as it was.
+func TestDecryptReportLeavesPlainEvidenceUntouched(t *testing.T) {
+	fixture := newEncryptedReportFixture(t, true, true)
+	report := decodeTestObject(t, fixture.data)
+	result := requireTestArray(t, report, "results")[0].(map[string]any)
+	controls := requireTestArray(t, result, "controls")
+	controls[0].(map[string]any)["evidence"] = []any{map[string]any{"path": "spec.hostPID", "value": "true"}}
+	result["controls"] = append(controls, map[string]any{"controlID": "C-0001", "evidence": nil})
+
+	decrypted, err := DecryptReport(mustMarshalTestJSON(t, report), []byte(testMasterKey))
+	require.NoError(t, err)
+
+	restoredControls := requireTestArray(t, requireTestArray(t, decodeTestObject(t, decrypted), "results")[0].(map[string]any), "controls")
+	assert.Equal(t, []any{map[string]any{"path": "spec.hostPID", "value": "true"}}, restoredControls[0].(map[string]any)["evidence"])
+	assert.Nil(t, restoredControls[1].(map[string]any)["evidence"])
 }
 
 func newEncryptedReportFixture(t *testing.T, includeResources, includeRawResource bool) encryptedReportFixture {
